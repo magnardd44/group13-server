@@ -1,14 +1,11 @@
 from stmpy import Machine, Driver,  get_graphviz_dot
-
 from threading import Thread
-
 import paho.mqtt.client as mqtt
-
-
 import json
-
 import os
 from dotenv import load_dotenv, dotenv_values 
+
+import time
 
 from supabase import create_client, Client
 
@@ -41,30 +38,64 @@ class MQTT_Client_1:
         parsed_json = json.loads(message_str)
 
 
-        request_json = {
-                    "car_id": parsed_json["car_id"],
+        if (parsed_json["trigger"] == "tag_received" or 
+            parsed_json["trigger"] == "licence_received" or 
+            parsed_json["trigger"] == "app_connected"):
+
+                self.stm_driver.send("tag_received", "server")
+
+                result = ( supabase.table("cars").select("*")
+                 .eq("car_id", parsed_json["car_id"])
+                 .execute() )
+            
+
+                request_json = {
                     "plate_number": parsed_json["plate_number"],
-                    "currently_charging": parsed_json["currently_charging"]
+                    "car_id": parsed_json["car_id"] 
                 }
 
+                if len(result.data) == 0:
+           
+                    time.sleep(1)
 
-        if parsed_json["current_state"] == "tag_received":
+                    self.stm_driver.send("invalid_information", "server")
+                    print("The car is not stored in the database!")
+                
+                    return
 
-            result = supabase.table("cars").select("*").eq("car_id", parsed_json["car_id"]).execute()
+                else:
 
-            print(result)
+                    data = ( supabase.table("test")
+                        .insert(json.dumps(request_json))
+                        .execute() )
+
+                    res, count = ( supabase.table("cars")
+                        .update({"currently_charging": True})
+                        .eq("car_id", parsed_json["car_id"])
+                        .execute() )
+
+                print('Insert res: ')
+                print(data)
+
+                print('Update res: ')
+                print(res)
 
 
-            if len(result.data) == 0: 
-                self.stm_driver.send("invalid_information", "server")
-                print("Car not stored in the database!")
+                self.stm_driver.send("accepted", "server")
+
                 return
 
-            data = supabase.table("test").insert(request_json).execute()
-            print("Insert vellykket!")
-            print(data)
+        elif parsed_json["trigger"] == "charger_disconnected":
+            data, count = ( supabase.table('cars')
+                .update({'currently_charging': False})
+                .eq('currently_charging', True)
+                .execute() )
 
-        self.stm_driver.send(parsed_json["current_state"], "server")
+            self.stm_driver.send("charger_disconnected", "server")
+            return
+
+        else: 
+            self.stm_driver.send(parsed_json["trigger"], "server")
 
 
     def start(self, broker, port):
@@ -75,7 +106,6 @@ class MQTT_Client_1:
         self.client.subscribe(topic)
 
         try:
-            # line below should not have the () after the function!
             thread = Thread(target=self.client.loop_forever)
             thread.start()
         except KeyboardInterrupt:
@@ -86,9 +116,20 @@ class Server:
             
     def __init__(self):
         self.payment_info = ""
+        self.json_data = {
+                "message_to": "charger",
+                "trigger": "send_ok",
+                }
+        self.error_json_data = {
+                "message_to": "charger",
+                "trigger": "rejected",
+                "error_message": ""
+                }
+
         
     def mark_charger_free(self):
         print("Charger is free")
+
     
     def mark_charger_occupied(self):
         print("Charger is occupied")
@@ -97,7 +138,7 @@ class Server:
         print("Validation started")
     
     def send_ok(self):
-        self.mqtt_client.publish(topic, "server:server_ok")
+        self.mqtt_client.publish(topic, json.dumps(self.json_data))
         print("Charging started")
         
     def store_info(self):
@@ -108,11 +149,15 @@ class Server:
         
     def reject_information(self):
         if message == "tag_received":
-            self.mqtt_client.publish(topic, {"error": "server:tag_info_rejected"})
+            self.error_json_data["error_message"] = "tag_info_rejected"
+         
         elif message == "licence_received":
-            self.mqtt_client.publish(topic, {"error": "server:licence_info_rejected"})
+           self.error_json_data["error_message"] = "licence_info_rejected"
+        
         else:
-            self.mqtt_client.publish(topic, {"error": "server:app_failed"})
+            self.error_json_data["error_message"] = "app_failed"
+           
+        self.mqtt_client.publish(topic, self.error_json_data)
         print("Charger notified")
 
 
@@ -143,8 +188,6 @@ t_conn_3 = {'trigger':'app_connected',
       'source':'connected', 
       'effect':'start_validation',
       'target':'validate_pay_info'}
-
-
 
 t_conn_4 = {'trigger':'identification_failed', 
       'source':'connected',
@@ -187,7 +230,6 @@ t_wait = {'trigger':'charger_disconnected',
       'source':'wait_disconnect',
       'effect':'mark_charger_free',
       'target':'idle'}
-
 
 
 
